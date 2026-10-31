@@ -35,6 +35,48 @@ POLICY_SCHEMA = {
 }
 
 
+# Built in policy used when the operator supplies no policy file. The
+# rules are aimed at the two shapes this tool is named for: ENV and ARG
+# lines in a Dockerfile, and environment entries in a compose file.
+DEFAULT_POLICY = {
+    "name": "Built in Docker policy",
+    "description": "Dockerfile ENV and ARG secrets, compose environment secrets, AWS access keys, and private key headers.",
+    "rules": [
+        {
+            "id": "dockerfile-env-arg-secret",
+            "description": "Dockerfile ENV or ARG line naming a secret with a value set",
+            "regex": r"(?im)^[ \t]*(?:ENV|ARG)[ \t]+[A-Za-z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*(?:[ \t]*=[ \t]*|[ \t]+)\S+",
+            "severity": "high",
+        },
+        {
+            "id": "compose-environment-secret",
+            "description": "Compose environment entry naming a secret with a value set",
+            "regex": r"(?im)^[ \t]*-?[ \t]*[\"']?[A-Za-z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*[\"']?[ \t]*[:=][ \t]*[\"']?\S+",
+            "severity": "high",
+        },
+        {
+            "id": "aws-access-key",
+            "description": "AWS access key ID",
+            "regex": r"AKIA[0-9A-Z]{16}",
+            "severity": "high",
+        },
+        {
+            "id": "private-key-header",
+            "description": "Private key header",
+            "regex": r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+            "severity": "high",
+        },
+    ],
+}
+
+
+def mask_match(value):
+    """Mask a matched value so a found secret is not copied into the log in full."""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return value[:4] + "*" * (len(value) - 8) + value[-4:]
+
+
 def validate_policy(policy):
     """
     Validates a policy against the POLICY_SCHEMA.
@@ -107,12 +149,15 @@ def scan_file(file_path, policy):
             matches = re.finditer(rule["regex"], content, re.MULTILINE)
             for match in matches:
                 logging.warning(
-                    f"[{rule['severity'].upper()}] {rule['id']}: {rule['description']} - File: {file_path}, Line: {content[:match.start()].count(os.linesep) + 1}, Match: {match.group(0)}"
+                    f"[{rule['severity'].upper()}] {rule['id']}: {rule['description']} - File: {file_path}, Line: {content[:match.start()].count(os.linesep) + 1}, Match: {mask_match(match.group(0))}"
                 )
+        return True
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}")
+        return False
     except Exception as e:
         logging.error(f"Error scanning file {file_path}: {e}")
+        return False
 
 
 def scan_directory(directory_path, policy):
@@ -123,18 +168,22 @@ def scan_directory(directory_path, policy):
         directory_path (str): The path to the directory to scan.
         policy (dict): The policy containing the regex rules.
     """
+    errors = 0
     for root, _, files in os.walk(directory_path):
         for file in files:
             file_path = os.path.join(root, file)
-            scan_file(file_path, policy)
+            if not scan_file(file_path, policy):
+                errors += 1
+    return errors
 
 
 @click.command()
 @click.option(
     "--policy-file",
     "-p",
-    required=True,
-    help="Path to the policy file (YAML or JSON).",
+    required=False,
+    default=None,
+    help="Path to the policy file (YAML or JSON). If omitted, the built in Docker policy is used.",
     type=click.Path(exists=True, readable=True),
 )
 @click.option(
@@ -160,32 +209,43 @@ def scan_directory(directory_path, policy):
 @click.version_option()
 def main(policy_file, target, log_level, recursive):
     """
-    madc-Docker-Secrets-Validator: Scans Dockerfiles and docker-compose.yml files for potential exposure of secrets.
+    madc-Docker-Secrets-Validator: Scans Dockerfiles and docker-compose.yml files for potential exposure of secrets, using a supplied policy file or, when none is supplied, the built in Docker policy.
     """
     logging.getLogger().setLevel(log_level)
 
     logging.info("Starting madc-Docker-Secrets-Validator...")
 
-    # Load the policy
-    policy = load_policy(policy_file)
-    if not policy:
-        logging.error("Failed to load policy. Exiting.")
-        sys.exit(1)
+    # Load the policy, or fall back to the built in Docker policy
+    if policy_file:
+        policy = load_policy(policy_file)
+        if not policy:
+            logging.error("Failed to load policy. Exiting.")
+            sys.exit(1)
+    else:
+        policy = DEFAULT_POLICY
+        logging.info("No policy file supplied. Using the built in Docker policy.")
 
     # Check if the target is a file or directory
+    errors = 0
     if os.path.isfile(target):
-        scan_file(target, policy)
+        if not scan_file(target, policy):
+            errors += 1
     elif os.path.isdir(target):
         if recursive:
-            scan_directory(target, policy)
+            errors += scan_directory(target, policy)
         else:
             # scan files within the first level of directory
             for file in os.listdir(target):
                 file_path = os.path.join(target, file)
                 if os.path.isfile(file_path):
-                    scan_file(file_path, policy)
+                    if not scan_file(file_path, policy):
+                        errors += 1
     else:
         logging.error(f"Invalid target: {target}")
+        sys.exit(1)
+
+    if errors:
+        logging.error(f"Scanning incomplete: {errors} file(s) could not be scanned.")
         sys.exit(1)
 
     logging.info("Scanning complete.")
